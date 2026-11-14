@@ -6,3 +6,4 @@ lightgbm==4.7.0
 scikit-learn==1.9.1
 matplotlib==3.11.2
 pytest==9.1.1
+tabulate==0.10.0

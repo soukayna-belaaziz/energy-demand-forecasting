@@ -95,6 +95,7 @@ class SarimaxForecaster:
     _start_params: np.ndarray | None = field(default=None, repr=False)
     last_result: object | None = field(default=None, repr=False)
     oracle_forecasts: dict = field(default_factory=dict, repr=False)
+    results: dict = field(default_factory=dict, repr=False)  # origin -> fitted results
 
     def __call__(self, fold: Fold) -> pd.DataFrame:
         y_tr = self.y.iloc[self.burn_in : fold.train_end_pos + 1]
@@ -109,6 +110,7 @@ class SarimaxForecaster:
             res = model.fit(start_params=self._start_params, disp=False, maxiter=300)
         self._start_params = res.params.to_numpy()
         self.last_result = res
+        self.results[fold.origin] = res
         f = res.get_forecast(steps=n, exog=x_te)
         # Sensitivity only: same fitted model, but realised (perfect) future temperature.
         x_oracle = sarimax_exog(self.temp, self.y.index).loc[fold.test_index]
@@ -154,7 +156,10 @@ class LightGBMForecaster:
     horizon: int
     level: float = 0.9
     seed: int = 42
+    feature_cols: list[str] = field(default_factory=lambda: list(FEATURE_COLS))
+    quantiles: bool = True
     models: dict = field(default_factory=dict, repr=False)
+    mean_models: dict = field(default_factory=dict, repr=False)  # origin -> fitted mean model
 
     def training_frame(self, fold: Fold) -> pd.DataFrame:
         """Rows whose origin AND target are both <= fold.origin (no look-ahead)."""
@@ -167,20 +172,20 @@ class LightGBMForecaster:
         tr = self.training_frame(fold)
         y_rel = tr["y_target"] - tr["y_roll7"]
         alpha = (1 - self.level) / 2
-        specs = {
-            "mean": {"objective": "regression"},
-            "lo": {"objective": "quantile", "alpha": alpha},
-            "hi": {"objective": "quantile", "alpha": 1 - alpha},
-        }
+        specs = {"mean": {"objective": "regression"}}
+        if self.quantiles:
+            specs["lo"] = {"objective": "quantile", "alpha": alpha}
+            specs["hi"] = {"objective": "quantile", "alpha": 1 - alpha}
         te = build_direct_features(self.y, self.temp, self.archive,
                                    pd.DatetimeIndex([fold.origin]),
                                    range(1, len(fold.test_index) + 1))
         out = {}
         for name, spec in specs.items():
             model = lgb.LGBMRegressor(**LGB_PARAMS, **spec, random_state=self.seed)
-            model.fit(tr[FEATURE_COLS], y_rel)
+            model.fit(tr[self.feature_cols], y_rel)
             self.models[name] = model
-            out[name] = model.predict(te[FEATURE_COLS]) + te["y_roll7"].to_numpy()
-        lo = np.minimum(out["lo"], out["mean"])
-        hi = np.maximum(out["hi"], out["mean"])
+            out[name] = model.predict(te[self.feature_cols]) + te["y_roll7"].to_numpy()
+        self.mean_models[fold.origin] = self.models["mean"]
+        lo = np.minimum(out.get("lo", out["mean"]), out["mean"])
+        hi = np.maximum(out.get("hi", out["mean"]), out["mean"])
         return pd.DataFrame({"mean": out["mean"], "lo": lo, "hi": hi}, index=fold.test_index)

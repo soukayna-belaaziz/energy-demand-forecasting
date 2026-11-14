@@ -52,7 +52,7 @@ def interval_score(y: np.ndarray, lo: np.ndarray, hi: np.ndarray, level: float) 
 
 
 def diebold_mariano(
-    e1: np.ndarray, e2: np.ndarray, h: int = 1, power: int = 2
+    e1: np.ndarray, e2: np.ndarray, h: int = 1, power: int = 2, max_lag: int | None = None
 ) -> tuple[float, float]:
     """Diebold-Mariano test with the Harvey-Leybourne-Newbold small-sample correction.
 
@@ -68,8 +68,12 @@ def diebold_mariano(
     if np.allclose(d, 0.0):
         return 0.0, 1.0
     dc = d - d_bar
-    gamma = [np.sum(dc[k:] * dc[: n - k]) / n for k in range(h)]
-    lrv = gamma[0] + 2 * sum(gamma[1:])
+    n_lags = h - 1 if max_lag is None else max_lag
+    gamma = [np.sum(dc[k:] * dc[: n - k]) / n for k in range(n_lags + 1)]
+    if max_lag is None:
+        lrv = gamma[0] + 2 * sum(gamma[1:])
+    else:  # Bartlett (Newey-West) weights keep the estimate positive
+        lrv = gamma[0] + 2 * sum((1 - k / (n_lags + 1)) * g for k, g in enumerate(gamma[1:], 1))
     if lrv <= 0:
         lrv = gamma[0]
     dm = d_bar / np.sqrt(lrv / n)

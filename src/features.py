@@ -123,6 +123,7 @@ def build_direct_features(
         lag_mat[ok, k] = yv[pos[ok] - k]
     roll7 = pd.Series(yv).rolling(7).mean().to_numpy()[pos]
     roll28 = pd.Series(yv).rolling(28).mean().to_numpy()[pos]
+    tw_origin = weighted_temperature(temp).to_numpy()[pos]  # realised, known at t
 
     frames = []
     for h in horizons:
@@ -138,10 +139,12 @@ def build_direct_features(
             "target_date": tgt_dates,
             "h": h,
             **{f"y_lag{k}": lag_mat[:, k] for k in range(N_LAGS)},
+            **{f"y_lag{k}_rel": lag_mat[:, k] - roll7 for k in range(7)},
             "y_roll7": roll7,
             "y_roll28": roll28,
             "y_same_dow_last": same_dow,
             **_target_temperature_block(temp, archive, pos, h),
+            "temp_w_origin": tw_origin,
             **{c: cal[c].to_numpy() for c in cal.columns},
             "y_target": np.where(tgt_pos < n, yv[np.clip(tgt_pos, None, n - 1)], np.nan),
         }
@@ -149,10 +152,18 @@ def build_direct_features(
     return pd.concat(frames, ignore_index=True)
 
 
-FEATURE_COLS: list[str] = (
-    ["h"]
-    + [f"y_lag{k}" for k in range(N_LAGS)]
-    + ["y_roll7", "y_roll28", "y_same_dow_last",
-       "temp_fc_target", "temp_w_target", "hdd_w_target", "temp_origin",
-       "dow", "is_weekend", "is_holiday", "xmas_period", "doy_sin", "doy_cos"]
-)
+_CALENDAR = ["dow", "is_weekend", "is_holiday", "xmas_period", "doy_sin", "doy_cos"]
+_TEMP = ["temp_fc_target", "temp_w_target", "hdd_w_target", "temp_origin"]
+
+# Two candidate feature sets; the choice is made on validation folds in 2019-2020
+# (src/validate_lgbm.py), never on the 2021-2022 test folds.
+FEATURE_SETS: dict[str, list[str]] = {
+    # consumption lags in absolute levels (GWh/day)
+    "levels": ["h"] + [f"y_lag{k}" for k in range(N_LAGS)]
+    + ["y_roll7", "y_roll28", "y_same_dow_last"] + _TEMP + _CALENDAR,
+    # last week's lags relative to the 7-day mean + temperature change since the origin
+    "relative": ["h"] + [f"y_lag{k}_rel" for k in range(7)]
+    + ["y_roll7", "y_roll28", "y_same_dow_last"] + _TEMP + ["temp_w_origin"] + _CALENDAR,
+}
+DEFAULT_FEATURE_SET = "levels"  # lower validation MAE, see reports/tables/lgbm_feature_set_validation.md
+FEATURE_COLS: list[str] = FEATURE_SETS[DEFAULT_FEATURE_SET]

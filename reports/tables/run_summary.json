@@ -1,0 +1,18 @@
+{
+  "n_days": 2283,
+  "start": "2016-10-01",
+  "end": "2022-12-31",
+  "n_origins": 34,
+  "first_origin": "2021-01-03",
+  "last_origin": "2022-11-27",
+  "sarimax_order": [
+    1,
+    1,
+    2
+  ],
+  "best_two_models": [
+    "SARIMAX",
+    "LightGBM"
+  ],
+  "runtime_seconds": 396.0
+}
