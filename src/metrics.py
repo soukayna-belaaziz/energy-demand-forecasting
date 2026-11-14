@@ -98,3 +98,41 @@ def score_table(fc: pd.DataFrame, by: list[str]) -> pd.DataFrame:
             }
         )
     return fc.groupby(by).apply(agg, include_groups=False)
+
+
+def pinball_loss(y: np.ndarray, q: np.ndarray, tau: float) -> float:
+    """Mean pinball (quantile) loss of quantile forecast ``q`` at level ``tau``."""
+    u = np.asarray(y, dtype=float) - np.asarray(q, dtype=float)
+    return float(np.mean(np.maximum(tau * u, (tau - 1) * u)))
+
+
+def crps_from_quantiles(y: np.ndarray, q: np.ndarray, taus: np.ndarray) -> float:
+    """CRPS approximated by twice the average pinball loss over a grid of quantiles.
+
+    ``q`` has shape (n_forecasts, len(taus)). With an equally spaced grid this is the
+    standard quantile-score approximation of CRPS = 2 * integral of the pinball loss.
+    """
+    q = np.asarray(q, dtype=float)
+    return float(2 * np.mean([pinball_loss(y, q[:, j], t) for j, t in enumerate(taus)]))
+
+
+def crps_gaussian(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> float:
+    """Closed-form CRPS of a normal predictive distribution (Gneiting-Raftery 2007)."""
+    y, mu, sigma = (np.asarray(a, dtype=float) for a in (y, mu, sigma))
+    z = (y - mu) / sigma
+    crps = sigma * (z * (2 * stats.norm.cdf(z) - 1) + 2 * stats.norm.pdf(z) - 1 / np.sqrt(np.pi))
+    return float(np.mean(crps))
+
+
+def dm_on_loss_differential(d: np.ndarray) -> tuple[float, float]:
+    """DM statistic for a serially uncorrelated loss-differential series (lag-0 variance).
+
+    Used for per-origin pooled losses: origins are 21 days apart, so the 14-day
+    windows do not overlap.
+    """
+    d = np.asarray(d, dtype=float)
+    n = len(d)
+    if np.allclose(d, d.mean()) and np.isclose(d.mean(), 0.0):
+        return 0.0, 1.0
+    stat = float(d.mean() / np.sqrt(d.var() / n) * np.sqrt((n - 1) / n))
+    return stat, float(2 * stats.t.sf(abs(stat), df=n - 1))

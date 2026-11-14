@@ -67,3 +67,31 @@ def test_score_table_groups():
     t = score_table(fc, ["model"])
     assert t.loc["a", "MAE"] == 1 and t.loc["b", "MAE"] == 0
     assert t.loc["a", "coverage"] == 1.0
+
+
+def test_pinball_and_crps_quantile_approximation():
+    from scipy import stats
+
+    from src.metrics import crps_from_quantiles, crps_gaussian, pinball_loss
+
+    assert pinball_loss(np.array([10.0]), np.array([8.0]), 0.9) == pytest.approx(1.8)
+    assert pinball_loss(np.array([10.0]), np.array([12.0]), 0.9) == pytest.approx(0.2)
+    rng = np.random.default_rng(0)
+    y = rng.normal(0, 1, 4000)
+    taus = np.linspace(0.01, 0.99, 99)
+    q = np.tile(stats.norm.ppf(taus), (len(y), 1))
+    exact = crps_gaussian(y, np.zeros_like(y), np.ones_like(y))
+    assert crps_from_quantiles(y, q, taus) == pytest.approx(exact, rel=0.03)
+
+
+def test_sarimax_spec_regressors():
+    from src.models import SarimaxSpec, sarimax_exog
+
+    idx = pd.date_range("2021-01-01", periods=20, freq="D")
+    temp = pd.Series(np.linspace(-5, 15, 20), index=idx)
+    base = sarimax_exog(temp, idx)
+    nl = sarimax_exog(temp, idx, SarimaxSpec("nl", hdd_knots=(5.0,), hdd_weekend=True))
+    assert set(nl.columns) - set(base.columns) == {"hdd_below5", "hdd_x_weekend"}
+    weekday = idx.dayofweek < 5
+    assert (nl.loc[weekday, "hdd_x_weekend"].dropna() == 0).all()
+    assert (nl["hdd_below5"].dropna() >= 0).all()
