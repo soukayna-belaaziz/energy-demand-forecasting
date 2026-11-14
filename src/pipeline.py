@@ -1,4 +1,5 @@
-"""End-to-end pipeline: data -> diagnostics -> rolling-origin backtest -> reports.
+"""End-to-end pipeline: data -> diagnostics -> SARIMAX spec validation -> rolling-origin
+backtest -> combination, conformal intervals, regime analysis -> reports.
 
 Run with:  python -m src.pipeline
 """
@@ -23,10 +24,14 @@ from src.diagnostics import (
     stationarity_tests,
 )
 from src.features import FEATURE_COLS, temperature_forecast_archive, temps_known_at
-from src.metrics import diebold_mariano, mae, mape, rmse, score_table
+from src.combination import combine_backtest, combine_daily
+from src.conformal import gaussian_quantiles, online_conformal_daily, rolling_conformal
+from src.evaluation import dm_daily, dm_table, probabilistic_scores, regime_table
+from src.metrics import coverage, mae, mape, rmse, score_table
 from src.models import (
-    LightGBMForecaster, SarimaxForecaster, make_ets, make_seasonal_naive, sarimax_exog,
+    LightGBMForecaster, make_ets, make_seasonal_naive, sarimax_exog,
 )
+from src.sarimax_selection import candidate_specs, select_sarimax
 
 BREAK_DATE = "2022-09-01"  # start of the visible post-crisis demand reduction
 PORTFOLIO_SHARE = 0.01  # illustrative: a shipper with 1% of German demand
@@ -84,7 +89,7 @@ def diagnostics_step(df: pd.DataFrame, bt_cfg: BacktestConfig, t0: float) -> tup
 
 
 def evaluation_tables(bt: pd.DataFrame, level: float) -> dict:
-    """Overall / by-horizon / by-year metrics and Diebold-Mariano tests."""
+    """Overall / by-horizon / by-year point metrics on the test origins."""
     overall = score_table(bt, ["model"]).sort_values("MAE")
     _write(overall, "metrics_overall")
     by_h = score_table(bt, ["model", "h"])
@@ -92,39 +97,44 @@ def evaluation_tables(bt: pd.DataFrame, level: float) -> dict:
     bt = bt.assign(year=bt["date"].dt.year)
     by_year = score_table(bt, ["model", "year"])[["MAE", "MAPE", "MASE", "coverage", "n"]]
     _write(by_year, "metrics_by_year")
-    plots.error_by_horizon(by_h, level, config.FIG_DIR / "fig4_error_by_horizon.png")
-
-    best_two = list(overall.index[:2])
-    a, b = best_two
-    rows = []
-    wide = bt.pivot_table(index=["origin", "h"], columns="model", values="error")
-    for h in [1, 3, 7, 14]:
-        e = wide.xs(h, level="h")
-        for power, loss in [(2, "squared"), (1, "absolute")]:
-            stat, p = diebold_mariano(e[a].to_numpy(), e[b].to_numpy(), h=1, power=power)
-            rows.append({"horizon": h, "loss": loss, "DM_stat": stat, "p_value": p,
-                         "n": len(e)})
-    # pooled: mean loss over the 14-day window per origin; windows do not overlap
-    for power, loss in [(2, "squared"), (1, "absolute")]:
-        la = (wide[a].abs() ** power).groupby(level="origin").mean()
-        lb_ = (wide[b].abs() ** power).groupby(level="origin").mean()
-        d = (la - lb_).to_numpy()
-        stat, p = _dm_on_losses(d)
-        rows.append({"horizon": "1-14 pooled", "loss": loss, "DM_stat": stat, "p_value": p,
-                     "n": len(d)})
-    dm = pd.DataFrame(rows).set_index(["horizon", "loss"])
-    _write(dm, "diebold_mariano", ".4f")
-    return {"overall": overall, "by_h": by_h, "by_year": by_year, "dm": dm,
-            "dm_models": best_two}
+    main = ["SARIMAX", "LightGBM", "ETS", "Seasonal naive", "Combination (inv_mse)"]
+    plots.error_by_horizon(by_h.loc[[m for m in main if m in by_h.index.get_level_values(0)]],
+                           level, config.FIG_DIR / "fig4_error_by_horizon.png")
+    return {"overall": overall, "by_h": by_h, "by_year": by_year}
 
 
-def _dm_on_losses(d: np.ndarray) -> tuple[float, float]:
-    """DM test applied directly to a loss-differential series (lag-0 variance + HLN)."""
-    from scipy import stats
+def interval_tables(
+    bt_all: pd.DataFrame, test_origins: pd.DatetimeIndex, level: float, models: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Raw vs conformal intervals: overall scores, coverage by horizon, calibrated tables."""
+    rows, by_h, calibrated = {}, [], {}
+    for model in models:
+        bm = bt_all[bt_all["model"] == model]
+        raw = gaussian_quantiles(bm[bm["origin"].isin(test_origins)], level)
+        variants = {
+            "raw": raw,
+            "conformal (horizon)": rolling_conformal(bm, test_origins, level, "horizon"),
+            "conformal (scaled)": rolling_conformal(bm, test_origins, level, "scaled"),
+        }
+        calibrated[model] = variants["conformal (scaled)"].assign(model=model)
+        for method, fc in variants.items():
+            rows[(model, method)] = probabilistic_scores(fc, level)
+            g = fc.groupby("h").apply(lambda d: pd.Series({
+                "coverage": coverage(d["y"], d["lo"], d["hi"]),
+                "width": float(np.mean(d["hi"] - d["lo"]))}), include_groups=False)
+            by_h.append(g.assign(model=model, method=method).reset_index())
+    overall = pd.DataFrame(rows).T
+    overall.index.names = ["model", "method"]
+    cov_h = pd.concat(by_h).set_index(["model", "method", "h"])
+    return overall, cov_h, calibrated
 
-    n = len(d)
-    stat = float(d.mean() / np.sqrt(d.var() / n) * np.sqrt((n - 1) / n))
-    return stat, float(2 * stats.t.sf(abs(stat), df=n - 1))
+
+def _rename_sarimax(name: str, chosen: str) -> str | None:
+    if name == chosen:
+        return "SARIMAX"
+    if name == "baseline":
+        return "SARIMAX baseline"
+    return None
 
 
 def main() -> None:
@@ -133,6 +143,7 @@ def main() -> None:
     for p in (config.PROCESSED_DIR, config.FIG_DIR, config.TABLE_DIR):
         p.mkdir(parents=True, exist_ok=True)
     bt_cfg, tf_cfg = BacktestConfig(), TempForecastConfig()
+    level = bt_cfg.interval_level
 
     df = build_dataset()
     df.to_csv(config.PROCESSED_DIR / "daily_gas_temperature.csv")
@@ -141,26 +152,86 @@ def main() -> None:
     order = diagnostics_step(df, bt_cfg, t0)
 
     archive = temperature_forecast_archive(df["temp"], bt_cfg.horizon, tf_cfg, config.SEED)
-    folds = list(rolling_origin_splits(df.index, bt_cfg.first_origin, bt_cfg.step_days,
-                                       bt_cfg.horizon))
+    all_folds = list(rolling_origin_splits(df.index, bt_cfg.calib_first_origin,
+                                           bt_cfg.step_days, bt_cfg.horizon))
+    first_test = pd.Timestamp(bt_cfg.first_origin)
+    valid_folds = [f for f in all_folds if f.origin < first_test]
+    folds = [f for f in all_folds if f.origin >= first_test]
+    if valid_folds[-1].test_index[-1] > first_test or folds[0].origin != first_test:
+        raise RuntimeError("validation folds must end before the first test origin")
+    test_origins = pd.DatetimeIndex([f.origin for f in folds])
     y = df["total"]
-    sarimax = SarimaxForecaster(y, df["temp"], archive, order, level=bt_cfg.interval_level)
-    lgbm = LightGBMForecaster(y, df["temp"], archive, bt_cfg.horizon,
-                              level=bt_cfg.interval_level, seed=config.SEED)
-    forecasters = {
-        "Seasonal naive": make_seasonal_naive(y, level=bt_cfg.interval_level),
-        "ETS": make_ets(y, level=bt_cfg.interval_level),
-        "SARIMAX": sarimax,
-        "LightGBM": lgbm,
-    }
-    parts = []
-    for name, fn in forecasters.items():
-        parts.append(run_backtest(y, folds, {name: fn}))
-        _log(f"backtest {name}: {len(folds)} origins", t0)
-    bt = pd.concat(parts, ignore_index=True)
-    bt.to_csv(config.TABLE_DIR / "backtest_forecasts.csv", index=False)
 
-    ev = evaluation_tables(bt, bt_cfg.interval_level)
+    # 1. SARIMAX specification chosen on validation folds only
+    specs = candidate_specs(order)
+    chosen, sel_tbl, sar_fcs, bt_valid = select_sarimax(
+        y, df["temp"], archive, specs, valid_folds, folds[0], level)
+    _write(sel_tbl, "sarimax_spec_validation", ".4f")
+    _log(f"SARIMAX spec validation done, chosen: {chosen.name}", t0)
+    sarimax = sar_fcs[chosen.name]
+    keep = {s: _rename_sarimax(s, chosen.name) for s in sar_fcs}
+    keep = {k: v for k, v in keep.items() if v is not None}
+    with warnings.catch_warnings():  # coefficient table of the chosen spec (with std. errors)
+        warnings.simplefilter("ignore")
+        f0 = folds[0]
+        mod = sarimax._model(y.iloc[sarimax.burn_in : f0.train_end_pos + 1],
+                             sarimax._x_real.iloc[sarimax.burn_in : f0.train_end_pos + 1])
+        res0 = mod.fit(start_params=sarimax.results[f0.origin].params.to_numpy(), disp=False,
+                       maxiter=300)
+    (config.TABLE_DIR / "sarimax_chosen_fit.txt").write_text(str(res0.summary()))
+
+    # 2. Backtest: test folds for all models, validation folds also for SARIMAX / LightGBM
+    lgbm = LightGBMForecaster(y, df["temp"], archive, bt_cfg.horizon, level=level,
+                              seed=config.SEED)
+    parts = [bt_valid[bt_valid["model"].isin(keep)].replace({"model": keep})]
+    for spec_name, label in keep.items():
+        parts.append(run_backtest(y, folds, {label: sar_fcs[spec_name]}))
+        _log(f"backtest {label}: {len(folds)} test origins", t0)
+    parts.append(run_backtest(y, all_folds, {"LightGBM": lgbm}))
+    _log(f"backtest LightGBM: {len(all_folds)} origins (validation + test)", t0)
+    for name, fn in {"Seasonal naive": make_seasonal_naive(y, level=level),
+                     "ETS": make_ets(y, level=level)}.items():
+        parts.append(run_backtest(y, folds, {name: fn}))
+        _log(f"backtest {name}: {len(folds)} test origins", t0)
+    bt_all = pd.concat(parts, ignore_index=True)
+    combos = []
+    for scheme in ("equal", "inv_mse"):
+        comb, w = combine_backtest(bt_all, ["SARIMAX", "LightGBM"], level, scheme)
+        combos.append(comb)
+        if scheme == "inv_mse":
+            wt = w[w["origin"].isin(test_origins)].groupby("h")[["SARIMAX", "LightGBM"]].mean()
+            _write(wt, "combination_weights_by_h")
+    bt_all = pd.concat([bt_all, *combos], ignore_index=True)
+    bt_all.to_csv(config.TABLE_DIR / "backtest_forecasts.csv", index=False)
+    bt = bt_all[bt_all["origin"].isin(test_origins)].reset_index(drop=True)
+
+    # 3. Point accuracy and Diebold-Mariano
+    ev = evaluation_tables(bt, level)
+    best_combo = min(["Combination (equal)", "Combination (inv_mse)"],
+                     key=lambda m: ev["overall"].loc[m, "MAE"])
+    dm = pd.concat([
+        dm_table(bt, "SARIMAX", "LightGBM"),
+        dm_table(bt, "SARIMAX", "SARIMAX baseline") if "SARIMAX baseline" in keep.values()
+        else pd.DataFrame(),
+        dm_table(bt, "Combination (equal)", "SARIMAX"),
+        dm_table(bt, "Combination (inv_mse)", "SARIMAX"),
+    ])
+    _write(dm, "diebold_mariano", ".4f")
+
+    # 4. Calibrated intervals (rolling split conformal), pinball loss and CRPS
+    int_models = ["SARIMAX", "LightGBM", "Combination (equal)", "Combination (inv_mse)"]
+    if "SARIMAX baseline" in keep.values():
+        int_models.insert(1, "SARIMAX baseline")
+    int_tbl, cov_h, calibrated = interval_tables(bt_all, test_origins, level, int_models)
+    _write(int_tbl, "interval_calibration", ".3f")
+    _write(cov_h.unstack("method"), "interval_coverage_by_horizon", ".3f")
+    plots.calibration_by_horizon(cov_h, level, config.FIG_DIR / "fig7_interval_calibration.png")
+    _log("conformal calibration done", t0)
+
+    # 5. Regimes: 2021 pre-crisis vs 2022 crisis
+    cal_all = pd.concat(calibrated.values(), ignore_index=True)
+    reg = regime_table(bt, {"conformal": cal_all})
+    _write(reg, "metrics_by_regime", ".3f")
 
     # Sensitivity: SARIMAX with perfect (realised) future temperature
     s_bt = bt[bt["model"] == "SARIMAX"].copy()
@@ -176,33 +247,46 @@ def main() -> None:
                              "MAE_oracle": mae(g.y, g.oracle_mean)}), include_groups=False)
     _write(sens_h, "sarimax_temperature_sensitivity_by_h")
 
-    # Operational day-ahead forecasts (h=1 for every test day)
-    sar_da = sarimax_day_ahead(sarimax, folds, bt_cfg.interval_level)
-    days = pd.DatetimeIndex(sar_da["date"])
-    da = pd.concat([
-        sar_da.assign(model="SARIMAX"),
-        lightgbm_day_ahead(lgbm, folds).assign(model="LightGBM"),
-        seasonal_naive_day_ahead(y, days).assign(model="Seasonal naive"),
-    ], ignore_index=True)
+    # 6. Operational day-ahead forecasts (h=1 for every day), calibration days included
+    da_parts = [sarimax_day_ahead(sar_fcs[s], all_folds, level).assign(model=lab)
+                for s, lab in keep.items()]
+    da_parts.append(lightgbm_day_ahead(lgbm, all_folds).assign(model="LightGBM"))
+    days_all = pd.DatetimeIndex(da_parts[0]["date"])
+    da_parts.append(seasonal_naive_day_ahead(y, days_all).assign(model="Seasonal naive"))
+    da = pd.concat(da_parts, ignore_index=True)
     da["y"] = y.loc[pd.DatetimeIndex(da["date"])].to_numpy()
     da["error"] = da["y"] - da["mean"]
+    for scheme in ("equal", "inv_mse"):
+        da = pd.concat([da, combine_daily(da, ["SARIMAX", "LightGBM"], scheme)],
+                       ignore_index=True)
+    test_days = days_all[days_all > first_test]
+    da_conf = online_conformal_daily(da[da["model"] == "SARIMAX"], test_days, level)
+    da = da[da["date"] > first_test].reset_index(drop=True)
     da.to_csv(config.TABLE_DIR / "day_ahead_forecasts.csv", index=False)
     da_tbl = da.groupby("model").apply(lambda g: pd.Series({
         "MAE": mae(g.y, g["mean"]), "RMSE": rmse(g.y, g["mean"]), "MAPE": mape(g.y, g["mean"]),
         "bias": float(g["error"].mean()), "n": len(g)}), include_groups=False).sort_values("MAE")
-    s_da = da[da.model == "SARIMAX"]
-    da_tbl.loc["SARIMAX", "coverage_90"] = float(((s_da.y >= s_da.lo) & (s_da.y <= s_da.hi)).mean())
+    for lab in keep.values():
+        s_da = da[da.model == lab]
+        da_tbl.loc[lab, "coverage_90_raw"] = coverage(s_da.y, s_da.lo, s_da.hi)
+        da_tbl.loc[lab, "width_raw"] = float((s_da.hi - s_da.lo).mean())
+    da_tbl.loc["SARIMAX", "coverage_90_conformal"] = coverage(da_conf.y, da_conf.lo, da_conf.hi)
+    da_tbl.loc["SARIMAX", "width_conformal"] = float((da_conf.hi - da_conf.lo).mean())
     _write(da_tbl, "day_ahead_metrics")
-    wide_da = da.pivot(index="date", columns="model", values="error")
-    dm_rows = []
-    for power, loss in [(2, "squared"), (1, "absolute")]:
-        stat, p = diebold_mariano(wide_da["SARIMAX"].to_numpy(), wide_da["LightGBM"].to_numpy(),
-                                  h=1, power=power, max_lag=7)
-        dm_rows.append({"comparison": "SARIMAX vs LightGBM", "loss": loss, "DM_stat": stat,
-                        "p_value": p, "n": len(wide_da)})
-    _write(pd.DataFrame(dm_rows).set_index(["comparison", "loss"]), "day_ahead_diebold_mariano",
-           ".4f")
-    _log(f"day-ahead evaluation: {len(days)} days", t0)
+    s_raw = gaussian_quantiles(da[da.model == "SARIMAX"], level)
+    da_prob = pd.DataFrame({"raw": probabilistic_scores(s_raw, level),
+                            "conformal (scaled)": probabilistic_scores(da_conf, level)}).T
+    _write(da_prob, "day_ahead_interval_calibration", ".3f")
+    da_dm = pd.concat([dm_daily(da, "SARIMAX", "LightGBM"),
+                       dm_daily(da, "SARIMAX", "SARIMAX baseline")
+                       if "SARIMAX baseline" in keep.values() else pd.DataFrame(),
+                       dm_daily(da, "Combination (equal)", "SARIMAX"),
+                       dm_daily(da, "Combination (inv_mse)", "SARIMAX")])
+    _write(da_dm, "day_ahead_diebold_mariano", ".4f")
+    da_reg = regime_table(da, {"conformal": da_conf.assign(model="SARIMAX")})
+    _write(da_reg, "day_ahead_metrics_by_regime", ".3f")
+    _log(f"day-ahead evaluation: {len(test_days)} test days ({len(days_all)} incl. validation)",
+         t0)
 
     # Business translation (illustrative, assumptions in src/business.py)
     prices = load_imbalance_prices()
@@ -224,17 +308,20 @@ def main() -> None:
     last = folds[-1]
     hist = y.iloc[last.train_end_pos - 27 : last.train_end_pos + 1]
     actual = y.loc[last.test_index]
-    res = sarimax.last_result
+    res = sarimax.results[last.origin]
     path = temps_known_at(df["temp"], archive, last.origin, bt_cfg.horizon)
-    f = res.get_forecast(steps=bt_cfg.horizon, exog=sarimax_exog(path, last.test_index))
+    f = res.get_forecast(steps=bt_cfg.horizon, exog=sarimax.exog(path, last.test_index))
     bands = {}
     for lvl in (0.5, 0.8, 0.95):
         ci = f.conf_int(alpha=1 - lvl)
         bands[lvl] = pd.DataFrame({"lo": ci.iloc[:, 0].to_numpy(), "hi": ci.iloc[:, 1].to_numpy()},
                                   index=last.test_index)
     lgb_last = bt[(bt.model == "LightGBM") & (bt.origin == last.origin)].set_index("date")
+    conf_last = calibrated["SARIMAX"]
+    conf_last = conf_last[conf_last.origin == last.origin].set_index("date")[["lo", "hi"]]
     plots.fan_chart(hist, actual, bands, pd.Series(f.predicted_mean.to_numpy(), last.test_index),
-                    lgb_last[["mean", "lo", "hi"]], config.FIG_DIR / "fig5_fan_chart.png")
+                    lgb_last[["mean", "lo", "hi"]], config.FIG_DIR / "fig5_fan_chart.png",
+                    conformal=conf_last)
     imp = pd.Series(lgbm.models["mean"].booster_.feature_importance("gain"), index=FEATURE_COLS)
     _write(imp.sort_values(ascending=False).to_frame("gain"), "lgbm_feature_importance", ".0f")
     plots.feature_importance(imp, config.FIG_DIR / "fig6_feature_importance.png")
@@ -242,14 +329,22 @@ def main() -> None:
     runtime = time.time() - t0
     summary = {
         "n_days": len(df), "start": str(df.index[0].date()), "end": str(df.index[-1].date()),
-        "n_origins": len(folds), "first_origin": str(folds[0].origin.date()),
-        "last_origin": str(folds[-1].origin.date()), "sarimax_order": order,
-        "best_two_models": ev["dm_models"], "runtime_seconds": round(runtime, 1),
+        "n_validation_origins": len(valid_folds),
+        "first_validation_origin": str(valid_folds[0].origin.date()),
+        "n_test_origins": len(folds), "first_test_origin": str(folds[0].origin.date()),
+        "last_test_origin": str(folds[-1].origin.date()), "arima_order": order,
+        "sarimax_spec": chosen.name, "best_combination": best_combo,
+        "n_day_ahead_test_days": len(test_days), "runtime_seconds": round(runtime, 1),
     }
     (config.TABLE_DIR / "run_summary.json").write_text(json.dumps(summary, indent=2))
+    print(sel_tbl.round(4).to_string())
     print(ev["overall"].round(3).to_string())
-    print(ev["dm"].round(4).to_string())
+    print(dm.round(4).to_string())
+    print(int_tbl.round(3).to_string())
+    print(reg.round(3).to_string())
     print(da_tbl.round(3).to_string())
+    print(da_prob.round(3).to_string())
+    print(da_dm.round(4).to_string())
     print(cost_tbl.round(0).to_string())
     _log("pipeline finished", t0)
 

@@ -14,8 +14,10 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf  # noqa: E402
 # Categorical palette (fixed order, one hue per model; validated reference palette)
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
 INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
-MODEL_ORDER = ["SARIMAX", "LightGBM", "ETS", "Seasonal naive"]
+MODEL_ORDER = ["SARIMAX", "LightGBM", "ETS", "Seasonal naive", "Combination (inv_mse)"]
 MODEL_COLOR = dict(zip(MODEL_ORDER, PALETTE))
+MODEL_COLOR["Combination (equal)"] = MODEL_COLOR["Combination (inv_mse)"]
+MODEL_COLOR["SARIMAX baseline"] = INK_2
 
 plt.rcParams.update({
     "figure.dpi": 110, "savefig.dpi": 130, "font.size": 9.5,
@@ -116,8 +118,12 @@ def error_by_horizon(by_h: pd.DataFrame, level: float, path: Path) -> None:
 def fan_chart(
     history: pd.Series, actual: pd.Series, sarimax_bands: dict[float, pd.DataFrame],
     sarimax_mean: pd.Series, lgbm: pd.DataFrame, path: Path,
+    conformal: pd.DataFrame | None = None,
 ) -> None:
-    """Fan chart for one origin: SARIMAX nested intervals (left), LightGBM quantiles (right)."""
+    """Fan chart for one origin: SARIMAX nested intervals (left), LightGBM quantiles (right).
+
+    ``conformal`` (lo/hi) is drawn as the dashed outline of the calibrated 90% interval.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.9), sharey=True)
     for ax in axes:
         ax.plot(history.index, history, color=INK, lw=1.4, label="observed (training)")
@@ -131,6 +137,10 @@ def fan_chart(
         axes[0].fill_between(b.index, b["lo"], b["hi"], color=c, alpha=alpha, lw=0,
                              label=f"{lvl:.0%} PI")
     axes[0].plot(sarimax_mean.index, sarimax_mean, color=c, lw=2, label="SARIMAX mean")
+    if conformal is not None:
+        for col in ("lo", "hi"):
+            axes[0].plot(conformal.index, conformal[col], color=c, lw=1.2, ls=":",
+                         label="calibrated 90% PI (conformal)" if col == "lo" else None)
     axes[0].set_title(f"SARIMAX fan chart, origin {history.index[-1].date()}")
     axes[0].set_ylabel("GWh/day")
     axes[0].legend(loc="lower left", fontsize=8)
@@ -153,4 +163,38 @@ def feature_importance(imp: pd.Series, path: Path, top: int = 15) -> None:
     ax.set_xlabel("share of total split gain (%)")
     ax.set_title("LightGBM feature importance (gain), last backtest fold")
     ax.grid(axis="y", visible=False)
+    _save(fig, path)
+
+
+def calibration_by_horizon(cov: pd.DataFrame, level: float, path: Path) -> None:
+    """Coverage and mean width of 90% intervals by horizon, raw vs conformal.
+
+    ``cov`` has a MultiIndex (model, method, h) and columns coverage, width.
+    """
+    cov = cov.sort_index()
+    models = [m for m in ["SARIMAX", "LightGBM", "Combination (inv_mse)"]
+              if m in cov.index.get_level_values(0)]
+    styles = {"raw": dict(ls="--", marker="o", alpha=0.75),
+              "conformal (scaled)": dict(ls="-", marker="s", alpha=1.0)}
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.9))
+    for model in models:
+        c = MODEL_COLOR[model]
+        for method, st in styles.items():
+            if (model, method) not in cov.index.droplevel(2):
+                continue
+            g = cov.loc[(model, method)]
+            lab = f"{model}, {method}"
+            axes[0].plot(g.index, 100 * g["coverage"], color=c, lw=1.8, ms=3.5, label=lab, **st)
+            axes[1].plot(g.index, g["width"], color=c, lw=1.8, ms=3.5, label=lab, **st)
+    axes[0].axhline(100 * level, color=INK, lw=1, ls="--")
+    axes[0].annotate(f"nominal {level:.0%}", (14, 100 * level), xytext=(0, 4),
+                     textcoords="offset points", ha="right", color=INK_2, fontsize=8.5)
+    axes[0].set_title("Coverage of 90% intervals, test origins 2021-2022")
+    axes[0].set_xlabel("horizon (days ahead)")
+    axes[0].set_ylabel("coverage (%)")
+    axes[0].legend(loc="lower left", fontsize=7.5)
+    axes[1].set_title("Mean interval width")
+    axes[1].set_xlabel("horizon (days ahead)")
+    axes[1].set_ylabel("GWh/day")
+    axes[1].set_ylim(bottom=0)
     _save(fig, path)
