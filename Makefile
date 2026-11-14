@@ -1,8 +1,12 @@
 PY ?= python
 
-.PHONY: all data validate pipeline test clean
+.PHONY: all full data validate pipeline notebook test clean
 
-all: data validate pipeline test
+# Default: download data, run the pipeline (incl. SARIMAX spec validation), run tests.
+all: data pipeline test
+
+# Also re-run the LightGBM feature-set validation and re-execute the walkthrough notebook.
+full: data validate pipeline notebook test
 
 data:
 	$(PY) data/download_data.py
@@ -12,6 +16,9 @@ validate:
 
 pipeline:
 	$(PY) -m src.pipeline
+
+notebook:
+	jupyter nbconvert --to notebook --execute --inplace notebooks/walkthrough.ipynb
 
 test:
 	$(PY) -m pytest -q
