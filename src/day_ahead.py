@@ -13,7 +13,7 @@ import pandas as pd
 
 from src.backtest import Fold
 from src.features import build_direct_features, temps_known_at
-from src.models import LightGBMForecaster, SarimaxForecaster, sarimax_exog
+from src.models import LightGBMForecaster, SarimaxForecaster
 
 
 def _windows(folds: list[Fold], last_date: pd.Timestamp) -> list[tuple[Fold, pd.DatetimeIndex]]:
@@ -35,7 +35,7 @@ def sarimax_day_ahead(
     swapped to the temperature forecast issued on d-1: + beta'(x_fc - x_realised).
     """
     y, temp, archive = fc.y, fc.temp, fc.archive
-    x_real = sarimax_exog(temp, y.index)
+    x_real = fc.exog(temp, y.index)
     rows = []
     for fold, days in _windows(folds, y.index[-1]):
         res = fc.results[fold.origin]
@@ -44,8 +44,8 @@ def sarimax_day_ahead(
         ci = pred.conf_int(alpha=1 - level)
         beta = res.params[x_real.columns].to_numpy()
         x_fc = pd.concat(
-            [sarimax_exog(temps_known_at(temp, archive, d - pd.Timedelta(days=1), 1),
-                          pd.DatetimeIndex([d])) for d in days]
+            [fc.exog(temps_known_at(temp, archive, d - pd.Timedelta(days=1), 1),
+                     pd.DatetimeIndex([d])) for d in days]
         )
         shift = (x_fc.to_numpy() - x_real.loc[days].to_numpy()) @ beta
         rows.append(pd.DataFrame({

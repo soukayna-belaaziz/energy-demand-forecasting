@@ -17,7 +17,9 @@ from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from src.backtest import Fold, Forecaster
-from src.features import FEATURE_COLS, build_direct_features, exog_matrix, temps_known_at
+from src.features import (
+    FEATURE_COLS, build_direct_features, exog_matrix, temps_known_at, weighted_temperature,
+)
 
 MIN_HISTORY = 28  # rows needed before lag/rolling features are defined
 
@@ -74,46 +76,109 @@ def make_ets(y: pd.Series, m: int = 7, level: float = 0.9, window: int = 730) ->
 
 
 # --------------------------------------------------------------------------- SARIMAX
-def sarimax_exog(temp_path: pd.Series, index: pd.DatetimeIndex) -> pd.DataFrame:
-    """HDD (weighted temperature), holiday/Christmas flags and weekday dummies."""
+@dataclass(frozen=True)
+class SarimaxSpec:
+    """Specification of the regression-with-ARIMA-errors model.
+
+    ``hdd_knots`` adds hinge terms ``max(k - T_w, 0)`` so the temperature response can
+    steepen in cold weather (piecewise-linear, i.e. non-linear HDD); ``hdd_weekend``
+    lets the heating slope differ on weekends (``HDD x weekend``), because industry
+    and offices heat less on Saturdays and Sundays. ``seasonal_order`` adds
+    stochastic weekly ARMA terms on top of the deterministic weekday dummies.
+    """
+
+    name: str = "baseline"
+    order: tuple[int, int, int] = (1, 1, 2)
+    seasonal_order: tuple[int, int, int, int] = (0, 0, 0, 0)
+    hdd_knots: tuple[float, ...] = ()
+    hdd_weekend: bool = False
+
+    @property
+    def n_arma(self) -> int:
+        """Number of ARMA parameters (degrees of freedom for Ljung-Box)."""
+        return self.order[0] + self.order[2] + self.seasonal_order[0] + self.seasonal_order[2]
+
+
+def sarimax_exog(
+    temp_path: pd.Series, index: pd.DatetimeIndex, spec: SarimaxSpec | None = None
+) -> pd.DataFrame:
+    """HDD (weighted temperature), holiday/Christmas flags, weekday dummies (+ spec extras)."""
+    spec = spec or SarimaxSpec()
     x = exog_matrix(temp_path, index)
     for k in range(1, 7):
         x[f"dow{k}"] = (index.dayofweek == k).astype(float)
+    if spec.hdd_knots:
+        tw = weighted_temperature(temp_path).reindex(index)
+        for knot in spec.hdd_knots:
+            x[f"hdd_below{knot:g}"] = np.maximum(knot - tw, 0.0)
+    if spec.hdd_weekend:
+        x["hdd_x_weekend"] = x["hdd_w"] * (index.dayofweek >= 5)
     return x
 
 
 @dataclass
 class SarimaxForecaster:
-    """Regression with ARIMA errors; order fixed beforehand, parameters refitted per fold."""
+    """Regression with ARIMA errors; specification fixed beforehand, parameters refitted per fold.
+
+    ``spec`` may also be a plain ``(p, d, q)`` tuple (baseline regressors).
+    ``init_params`` (by parameter name) seeds the very first optimisation; afterwards
+    each fold warm-starts from the previous fold's estimates.
+    """
 
     y: pd.Series
     temp: pd.Series
     archive: pd.DataFrame
-    order: tuple[int, int, int]
+    spec: SarimaxSpec | tuple[int, int, int] = field(default_factory=SarimaxSpec)
     level: float = 0.9
     burn_in: int = 3  # weighted temperature needs 3 previous days
+    init_params: pd.Series | None = None
     _start_params: np.ndarray | None = field(default=None, repr=False)
     last_result: object | None = field(default=None, repr=False)
     oracle_forecasts: dict = field(default_factory=dict, repr=False)
     results: dict = field(default_factory=dict, repr=False)  # origin -> fitted results
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.spec, SarimaxSpec):
+            self.spec = SarimaxSpec(name=f"ARIMA{tuple(self.spec)}", order=tuple(self.spec))
+        self._x_real = sarimax_exog(self.temp, self.y.index, self.spec)
+
+    def exog(self, temp_path: pd.Series, index: pd.DatetimeIndex) -> pd.DataFrame:
+        """Regressors of this specification for ``index`` from a temperature path."""
+        return sarimax_exog(temp_path, index, self.spec)
+
+    def _model(self, y_tr: pd.Series, x_tr: pd.DataFrame) -> SARIMAX:
+        return SARIMAX(y_tr, exog=x_tr, order=self.spec.order,
+                       seasonal_order=self.spec.seasonal_order)
+
+    def _start(self, model: SARIMAX) -> np.ndarray | None:
+        if self._start_params is not None:
+            return self._start_params
+        if self.init_params is None:
+            return None
+        sp = pd.Series(model.start_params, index=model.param_names)
+        common = sp.index.intersection(self.init_params.index)
+        sp[common] = self.init_params[common]
+        return sp.to_numpy()
+
     def __call__(self, fold: Fold) -> pd.DataFrame:
         y_tr = self.y.iloc[self.burn_in : fold.train_end_pos + 1]
-        x_tr = sarimax_exog(self.temp, self.y.index)[self.burn_in : fold.train_end_pos + 1]
+        x_tr = self._x_real.iloc[self.burn_in : fold.train_end_pos + 1]
         n = len(fold.test_index)
         path = temps_known_at(self.temp, self.archive, fold.origin, n)
-        x_te = sarimax_exog(path, fold.test_index)
-        model = SARIMAX(y_tr, exog=x_tr, order=self.order)
+        x_te = self.exog(path, fold.test_index)
+        model = self._model(y_tr, x_tr)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # warm start from the previous fold's estimates speeds up re-estimation
-            res = model.fit(start_params=self._start_params, disp=False, maxiter=300)
+            # warm start from the previous fold's estimates speeds up re-estimation;
+            # parameter standard errors are not needed in the backtest (cov_type="none")
+            res = model.fit(start_params=self._start(model), disp=False, maxiter=300,
+                            cov_type="none")
         self._start_params = res.params.to_numpy()
         self.last_result = res
         self.results[fold.origin] = res
         f = res.get_forecast(steps=n, exog=x_te)
         # Sensitivity only: same fitted model, but realised (perfect) future temperature.
-        x_oracle = sarimax_exog(self.temp, self.y.index).loc[fold.test_index]
+        x_oracle = self._x_real.loc[fold.test_index]
         self.oracle_forecasts[fold.origin] = res.get_forecast(
             steps=n, exog=x_oracle).predicted_mean.to_numpy()
         ci = f.conf_int(alpha=1 - self.level)

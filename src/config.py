@@ -26,7 +26,11 @@ SEASONAL_PERIOD = 7
 class BacktestConfig:
     """Rolling-origin (expanding window) backtest design."""
 
-    first_origin: str = "2021-01-03"  # last training day of the first fold
+    first_origin: str = "2021-01-03"  # last training day of the first test fold
+    # Pre-test folds on the same 21-day grid (2019-09-29 = 2021-01-03 - 22 x 21 days).
+    # They are used to choose the SARIMAX specification and as the initial
+    # calibration set for conformal intervals and combination weights.
+    calib_first_origin: str = "2019-09-29"
     step_days: int = 21  # spacing between consecutive origins
     horizon: int = 14  # forecast days 1..horizon
     interval_level: float = 0.90  # nominal prediction-interval coverage
