@@ -66,7 +66,7 @@ def load_consumption(raw_dir: Path = config.RAW_DIR) -> pd.DataFrame:
 
 
 def load_temperature(raw_dir: Path = config.RAW_DIR, country: str = "DE") -> pd.Series:
-    """ERA5 population-unweighted country-average 2 m air temperature, deg C."""
+    """ERA5 country-average (NUTS0) daily 2 m air temperature from C3S, converted to deg C."""
     path = raw_dir / "era5_t2m_nuts0_daily.csv"
     with open(path, encoding="utf-8", errors="replace") as fh:
         skip = next(i for i, line in enumerate(fh) if line.startswith("Date,"))
