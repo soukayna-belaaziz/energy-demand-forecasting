@@ -2,17 +2,18 @@
   "n_days": 2283,
   "start": "2016-10-01",
   "end": "2022-12-31",
-  "n_origins": 34,
-  "first_origin": "2021-01-03",
-  "last_origin": "2022-11-27",
-  "sarimax_order": [
+  "n_validation_origins": 22,
+  "first_validation_origin": "2019-09-29",
+  "n_test_origins": 34,
+  "first_test_origin": "2021-01-03",
+  "last_test_origin": "2022-11-27",
+  "arima_order": [
     1,
     1,
     2
   ],
-  "best_two_models": [
-    "SARIMAX",
-    "LightGBM"
-  ],
-  "runtime_seconds": 206.2
+  "sarimax_spec": "+ non-linear HDD + weekly AR",
+  "best_combination": "Combination (inv_mse)",
+  "n_day_ahead_test_days": 727,
+  "runtime_seconds": 589.5
 }
