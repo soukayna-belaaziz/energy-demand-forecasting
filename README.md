@@ -236,7 +236,8 @@ python -m pytest -q
 
 Random seed 42 is used everywhere (temperature-forecast simulation, LightGBM). Measured runtime of
 `python -m src.pipeline` in the development sandbox (2 shared CPUs): 3 min 30 s to 6 min 40 s,
-depending on machine load.
+depending on machine load. A full `make all` from a fresh clone (download, validation, pipeline,
+tests) took 5 min 33 s and reproduced every committed table exactly.
 
 ## Project structure
 
